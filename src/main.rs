@@ -1,7 +1,11 @@
 mod size;
+use sha1::{Digest, Sha1};
 use size::Size;
 
+use std::fs::File;
 use std::hash::Hash;
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -13,9 +17,11 @@ use walkdir::{DirEntry, WalkDir};
 
 #[derive(PartialEq, Eq, ValueEnum, Clone)]
 enum Algorithm {
-    NAME,
-    SIZE,
-    BOTH,
+    Name,
+    Size,
+    NameAndSize,
+    FuzzyContent,
+    FullContent,
 }
 
 #[derive(Parser)]
@@ -26,8 +32,32 @@ struct Args {
     #[arg(short, long, default_value_t = 1.0)]
     min_size: f32,
 
-    #[arg(value_enum, long, default_value_t = Algorithm::NAME)]
+    #[arg(value_enum, long, default_value_t = Algorithm::Name)]
     algorithm: Algorithm,
+}
+
+// Compute the SHA1 hash of reading the first n bytes of the file or all of the file
+fn sha1_read(path: &Path, bytes_limit: u16) -> Option<Vec<u8>> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    if bytes_limit > 0 {
+        let mut buffer = vec![0; bytes_limit as usize];
+        reader.read(&mut buffer).ok();
+        return Some(Sha1::new_with_prefix(buffer).finalize()[..].to_owned());
+    }
+
+    // If limit was provided as 0 then process all of the file
+    let mut hasher = Sha1::new();
+    loop {
+        let buffer = reader.fill_buf().unwrap_or(&[]);
+        let length = buffer.len();
+        if length == 0 {
+            break;
+        }
+        hasher.update(buffer);
+        reader.consume(length);
+    }
+    return Some(hasher.finalize()[..].to_owned());
 }
 
 // Groups a vector of DirEntry according to the result of the closure f
@@ -52,7 +82,22 @@ fn find_duplicate_files(
 ) -> impl Iterator<Item = Vec<DirEntry>> {
     let mut dupes = vec![files].into_iter();
 
-    if [Algorithm::SIZE, Algorithm::BOTH].contains(&algorithm) {
+    if [Algorithm::Name, Algorithm::NameAndSize].contains(&algorithm) {
+        dupes = dupes
+            .map(|g| find_duplicates_by(g, |e| Some(e.file_name().to_owned())))
+            .flatten()
+            .collect::<Vec<_>>()
+            .into_iter();
+        println!("Found {} duplicate groups by name", dupes.len());
+    }
+    if [
+        Algorithm::Size,
+        Algorithm::NameAndSize,
+        Algorithm::FuzzyContent,
+        Algorithm::FullContent,
+    ]
+    .contains(&algorithm)
+    {
         dupes = dupes
             .map(|g| find_duplicates_by(g, |e| e.metadata().map(|m| m.size()).ok()))
             .flatten()
@@ -60,13 +105,32 @@ fn find_duplicate_files(
             .into_iter();
         println!("Found {} duplicate groups by size", dupes.len());
     }
-    if [Algorithm::NAME, Algorithm::BOTH].contains(&algorithm) {
+    if [Algorithm::FuzzyContent, Algorithm::FullContent].contains(&algorithm) {
         dupes = dupes
-            .map(|g| find_duplicates_by(g, |e| Some(e.file_name().to_owned())))
+            .map(|g| find_duplicates_by(g, |e| sha1_read(e.path(), 1024)))
             .flatten()
             .collect::<Vec<_>>()
             .into_iter();
-        println!("Found {} duplicate groups by name", dupes.len());
+        println!("Found {} duplicate groups by first 1024 bytes", dupes.len());
+
+        dupes = dupes
+            .map(|g| find_duplicates_by(g, |e| sha1_read(e.path(), 4096)))
+            .flatten()
+            .collect::<Vec<_>>()
+            .into_iter();
+        println!("Found {} duplicate groups by first 4096 bytes", dupes.len());
+    }
+
+    if [Algorithm::FullContent].contains(&algorithm) {
+        dupes = dupes
+            .map(|g| find_duplicates_by(g, |e| sha1_read(e.path(), 0)))
+            .flatten()
+            .collect::<Vec<_>>()
+            .into_iter();
+        println!(
+            "Found {} duplicate groups by full content bytes",
+            dupes.len()
+        );
     }
 
     println!();
